@@ -1,0 +1,44 @@
+services:
+
+  db:
+    image: postgres:17
+
+    container_name: cps_database
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cps_db}
+      POSTGRES_USER: ${POSTGRES_USER:-cps_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cps_password}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    restart: unless-stopped
+
+  backend:
+    build: .
+
+    container_name: cps_backend
+
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cps_user}:${POSTGRES_PASSWORD:-cps_password}@db:5432/${POSTGRES_DB:-cps_db}
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
