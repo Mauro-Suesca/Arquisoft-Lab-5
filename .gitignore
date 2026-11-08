@@ -1,6 +1,10 @@
 # Local Docker Compose overrides (credentials)
 /.env
 
+# Local build artifacts
+node_modules/
+dist/
+
 # Python
 __pycache__/
 *.pyc

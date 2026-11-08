@@ -4,91 +4,127 @@ This document describes how the CPS Calculator runs with Docker Compose and Ngin
 
 ## 1. Architecture overview
 
+The deployment follows the agreed components & connectors (C&C) chain:
+
+`Web Browser → Reverse Proxy → Web Frontend → CPS Calculator → Relational Database`
+
 ```text
                  host :8080
- Browser ───────────────────► nginx (reverse proxy)
+ Browser ───────────────────► nginx (main reverse proxy)          [edge_net]
+                                 │  every request, URI unchanged
+                                 ▼
+                         web-frontend:80 (nginx)                  [edge_net + app_net]
+                           ├── /       → React static build
+                           └── /api/*  → strips "/api", forwards
                                  │
-                 ┌───────────────┴────────────────┐
-                 │ /                              │ /api/*
-                 ▼                                ▼
-          web-frontend:80                   backend:8000
-     (React build served by nginx)           (FastAPI)
-                                                  │
-                                                  ▼
-                                              db:5432
-                                           (PostgreSQL 17)
-                                                  │
-                                                  ▼
-                                      volume: postgres_data
+                                 ▼
+                           backend:8000 (FastAPI)                 [app_net + data_net]
+                                 │
+                                 ▼
+                             db:5432 (PostgreSQL 17)              [data_net]
+                                 │
+                                 ▼
+                       volume: postgres_data
 ```
 
-- The browser talks **only** to Nginx on `http://localhost:8080`.
-- Frontend and API share the same origin, so no CORS configuration is needed.
-- The backend and the database have no published ports; they are reachable only
-  inside the Docker networks.
+- The browser talks **only** to the main reverse proxy on `http://localhost:8080`.
+- The main reverse proxy has **one** destination: the Web Frontend server. It has
+  no route, upstream or network path to the backend.
+- The Web Frontend server serves the React build and is the connector to the
+  CPS Calculator (`/api/` → `backend:8000`).
+- The backend and the database have no published ports.
 
 ## 2. Docker services
 
-| Service        | Image / build                         | Internal port | Published | Purpose                                   |
-|----------------|---------------------------------------|---------------|-----------|-------------------------------------------|
-| `nginx`        | `nginx:1.27-alpine`                   | 80            | `8080`    | Single entry point, reverse proxy         |
-| `web-frontend` | `./web-frontend/Dockerfile`           | 80            | –         | Serves the static React (Vite) build      |
-| `backend`      | `./cps_backend/dockerfile`            | 8000          | –         | FastAPI REST API                          |
-| `db`           | `postgres:17`                         | 5432          | –         | Stores users and their max CPS            |
+| Service        | Image / build                         | Internal port | Published | Purpose                                                  |
+|----------------|---------------------------------------|---------------|-----------|----------------------------------------------------------|
+| `nginx`        | `nginx:1.27-alpine`                   | 80            | `8080`    | Main reverse proxy, single entry point                   |
+| `web-frontend` | `./web-frontend/Dockerfile`           | 80            | –         | Serves the React build; forwards `/api/` to the backend  |
+| `backend`      | `./cps_backend/dockerfile`            | 8000          | –         | CPS Calculator REST API (FastAPI)                        |
+| `db`           | `postgres:17`                         | 5432          | –         | Relational database (users and max CPS)                  |
 
-Start-up order is enforced with `depends_on` + health checks:
+### Two Nginx instances
 
-1. `db` starts; its health check runs `pg_isready`.
-2. `backend` starts only when `db` is **healthy**. On start-up it creates the
-   tables (`Base.metadata.create_all`). Its own health check calls `GET /health`.
-3. `web-frontend` starts (no dependencies).
-4. `nginx` starts when `backend` is **healthy** and `web-frontend` has started,
-   so every upstream hostname already exists when Nginx resolves it.
+| Instance | Config file | Role |
+|----------|-------------|------|
+| Main reverse proxy (`nginx` service) | `etc/nginx/sites-available/localhost` (mounted read-only) | Receives all browser traffic and forwards **everything** through the `backend_servers` upstream (`least_conn`, currently one server: `web-frontend:80`), keeping the URI (including `/api/`) unchanged. |
+| Web Frontend server (inside `web-frontend`) | `web-frontend/nginx.conf` (copied into the image) | Serves `/usr/share/nginx/html` with SPA fallback (`try_files … /index.html`) and forwards `/api/<path>` to `http://backend:8000/<path>`. |
+
+### Start-up order
+
+Only the start-up dependencies that are technically required are declared:
+
+1. `db` starts; health check `pg_isready`.
+2. `backend` starts when `db` is **healthy**, because it creates the tables on
+   start-up. Health check `GET /health`.
+3. `web-frontend` starts without dependencies: its Nginx resolves `backend` per
+   request, so it does not need the API to be running. Health check fetches `/`.
+4. `nginx` starts when `web-frontend` is **healthy**, because its upstream host
+   `web-frontend` is resolved when Nginx starts.
+
+While the backend is still starting, the page loads but `/api/...` returns `502`.
 
 ## 3. Network communication
 
-Two user-defined bridge networks are declared in `compose.yaml`:
+| Network    | Members                     | `internal` | Connector                         |
+|------------|-----------------------------|------------|-----------------------------------|
+| `edge_net` | `nginx`, `web-frontend`     | no         | Reverse Proxy → Web Frontend      |
+| `app_net`  | `web-frontend`, `backend`   | yes        | Web Frontend → CPS Calculator     |
+| `data_net` | `backend`, `db`             | yes        | CPS Calculator → Database         |
 
-| Network    | Members                            | Notes                                         |
-|------------|------------------------------------|-----------------------------------------------|
-| `app_net`  | `nginx`, `web-frontend`, `backend` | Proxy traffic                                 |
-| `data_net` | `backend`, `db`                    | `internal: true` – no traffic outside Docker  |
+Containers resolve each other through Docker's embedded DNS using the **service
+name**, and only for services that share at least one network. Resulting
+reachability:
 
-Containers find each other through Docker's embedded DNS using the **service
-name** (`backend`, `web-frontend`, `db`). `localhost` inside a container refers to
-the container itself, so it is never used between services.
+| From \ To      | nginx | web-frontend | backend | db  |
+|----------------|:-----:|:------------:|:-------:|:---:|
+| `nginx`        |   –   |      ✔       |    ✘    |  ✘  |
+| `web-frontend` |   ✔   |      –       |    ✔    |  ✘  |
+| `backend`      |   ✘   |      ✔       |    –    |  ✔  |
+| `db`           |   ✘   |      ✘       |    ✔    |  –  |
 
-Because `nginx` is not attached to `data_net`, the proxy cannot reach the database
-at all: only the backend can.
+- `nginx` is attached only to `edge_net`, so the name `backend` does not even
+  resolve inside it.
+- `edge_net` is the only non-internal network because Docker needs it to publish
+  port 8080 on the host.
+- `app_net` and `data_net` are `internal: true`: their containers cannot reach,
+  or be reached from, anything outside Docker through them.
 
-### Nginx routing
+### Request flow
 
-The configuration lives in `etc/nginx/sites-available/localhost` and is mounted
-read-only as `/etc/nginx/conf.d/default.conf`.
+| Browser request                          | Main reverse proxy → | Web Frontend server →               |
+|------------------------------------------|----------------------|-------------------------------------|
+| `GET http://localhost:8080/`             | `web-frontend:80/`   | serves `index.html`                 |
+| `GET http://localhost:8080/assets/…`     | `web-frontend:80/assets/…` | serves the static file        |
+| `GET http://localhost:8080/api/health`   | `web-frontend:80/api/health` | `backend:8000/health`       |
+| `GET/POST http://localhost:8080/api/users/x` | `web-frontend:80/api/users/x` | `backend:8000/users/x` |
 
-| Browser request                         | Forwarded to                         |
-|-----------------------------------------|--------------------------------------|
-| `GET http://localhost:8080/`            | `http://web-frontend:80/`            |
-| `GET http://localhost:8080/api/health`  | `http://backend:8000/health`         |
-| `GET http://localhost:8080/api/users/x` | `http://backend:8000/users/x`        |
-| `POST http://localhost:8080/api/users/x`| `http://backend:8000/users/x`        |
-| `GET http://localhost:8080/api/docs`    | `http://backend:8000/docs` (Swagger) |
+The Web Frontend server removes the `/api` prefix with
+`rewrite ^/api/(.*)$ /$1 break;`, so the FastAPI routes stay unchanged.
 
-The trailing slash in `proxy_pass http://backend_servers/;` makes Nginx replace the
-`/api/` prefix with `/`, so the FastAPI routes stay exactly as they are.
-Uvicorn runs with `--root-path /api` so that Swagger UI (`/api/docs`) loads
-`/api/openapi.json` correctly; it does not change the routes.
+> The backend runs with its original Dockerfile command. Swagger UI is therefore
+> not usable through `/api/docs` (it requests `/openapi.json` without the prefix).
+> Use `docker compose exec web-frontend wget -q -O - http://backend:8000/openapi.json`
+> to inspect the API schema if needed.
+
+The Web Frontend server resolves `backend` at request time through Docker's DNS
+(`resolver 127.0.0.11`). This lets the container start without the backend (for
+example with `web-frontend/compose.yaml` alone, where `/api/` simply returns
+`502`) and follows the backend if its container is recreated with a new IP.
 
 ### Frontend API URL
 
-`web-frontend/src/services/cpsService.js` uses
-`import.meta.env.VITE_API_URL || "/api"`. Vite inlines this value **at build
-time**. The Docker build receives `VITE_API_URL=/api` (build arg in
-`compose.yaml`, also the default `ARG` in the Dockerfile), so the bundle calls
-relative URLs such as `/api/users/<name>`, which hit Nginx on the same origin.
+React runs in the **browser**, so its `fetch()` calls do not originate from the
+`web-frontend` container. `web-frontend/src/services/cpsService.js` uses
+`import.meta.env.VITE_API_URL || "/api"`; Vite inlines this value at build time.
+`web-frontend/.env` (`VITE_API_URL=http://localhost:8000`) is excluded from the
+Docker build context by `web-frontend/.dockerignore`, so the image uses the
+`/api` fallback. The browser then calls relative URLs such as
+`/api/users/<name>` on `localhost:8080`, which travel through the connector chain
+above.
 
-`web-frontend/.env` (`http://localhost:8000`) is only for running Vite locally
-outside Docker; it is excluded from the image by `.dockerignore`.
+> Keep `.env` in `web-frontend/.dockerignore`. If it is removed, the bundle will
+> call `http://localhost:8000`, which is not published by the Docker stack.
 
 ## 4. Environment variables
 
@@ -102,10 +138,10 @@ Defined in the repository root (optional `.env`, see `.env.example`):
 
 Derived values:
 
-| Variable       | Service        | Value                                                                    |
-|----------------|----------------|--------------------------------------------------------------------------|
-| `DATABASE_URL` | `backend`      | `postgresql+psycopg://<user>:<password>@db:5432/<db>`                    |
-| `VITE_API_URL` | `web-frontend` | `/api` (build arg, inlined into the JavaScript bundle)                   |
+| Variable       | Service        | Value                                                   |
+|----------------|----------------|---------------------------------------------------------|
+| `DATABASE_URL` | `backend`      | `postgresql+psycopg://<user>:<password>@db:5432/<db>`   |
+| `VITE_API_URL` | `web-frontend` | not set in Docker; the code falls back to `/api`        |
 
 > PostgreSQL only applies `POSTGRES_*` when the data directory is empty. If you
 > change the credentials after the volume exists, the old ones remain valid.
@@ -124,7 +160,7 @@ docker compose config
 # build images and start all services in the background
 docker compose up --build -d
 
-# service status (db and backend should show "healthy")
+# service status (db, backend and web-frontend should show "healthy")
 docker compose ps
 ```
 
@@ -132,26 +168,26 @@ Open <http://localhost:8080>.
 
 ### Day-to-day commands
 
-| Task                                   | Command                                            |
-|----------------------------------------|----------------------------------------------------|
-| Start (build if needed)                | `docker compose up --build -d`                     |
-| Stop and remove containers (keep data) | `docker compose down`                              |
-| Stop without removing containers       | `docker compose stop`                              |
-| Rebuild one service                    | `docker compose up --build -d backend`             |
-| Rebuild without cache                  | `docker compose build --no-cache`                  |
-| All logs (follow)                      | `docker compose logs -f`                           |
-| Logs of one service                    | `docker compose logs -f backend`                   |
-| Reload Nginx after editing its config  | `docker compose restart nginx`                     |
+| Task                                   | Command                                             |
+|----------------------------------------|-----------------------------------------------------|
+| Start (build if needed)                | `docker compose up --build -d`                      |
+| Stop and remove containers (keep data) | `docker compose down`                               |
+| Stop without removing containers       | `docker compose stop`                               |
+| Rebuild one service                    | `docker compose up --build -d backend`              |
+| Rebuild without cache                  | `docker compose build --no-cache`                   |
+| All logs (follow)                      | `docker compose logs -f`                            |
+| Logs of one service                    | `docker compose logs -f web-frontend`               |
+| Reload the main proxy after editing it | `docker compose restart nginx`                      |
 | Open a psql shell                      | `docker compose exec db psql -U cps_user -d cps_db` |
 
 ### Verification
 
 ```bash
-# API through the proxy
+# API through the full chain (nginx -> web-frontend -> backend)
 curl http://localhost:8080/api/health
 # -> {"status":"ok"}
 
-# Full flow: write and read through nginx -> backend -> PostgreSQL
+# Full flow: write and read through nginx -> web-frontend -> backend -> PostgreSQL
 curl -X POST http://localhost:8080/api/users/alice \
      -H "Content-Type: application/json" -d '{"clicks": 40}'
 # -> {"Name":"alice","CPS":8.0,"maxCPS":0.0}
@@ -161,8 +197,11 @@ curl http://localhost:8080/api/users/alice
 # Data stored in the database
 docker compose exec db psql -U cps_user -d cps_db -c "SELECT * FROM users;"
 
-# Backend and DB are NOT exposed on the host (both should fail)
-curl http://localhost:8000/health
+# Network isolation checks
+curl http://localhost:8000/health                                  # must fail: backend not published
+docker compose exec nginx getent hosts backend                     # must print nothing: not resolvable
+docker compose exec nginx wget -q -O - http://backend:8000/health  # must fail
+docker compose exec web-frontend wget -q -O - http://backend:8000/health  # -> {"status":"ok"}
 ```
 
 On Windows PowerShell use `curl.exe` instead of `curl`, and for the POST body:
@@ -184,12 +223,13 @@ volume is `cps-calculator_postgres_data` (`docker volume ls`).
 |---------|--------------------|
 | `Bind for 0.0.0.0:8080 failed: port is already allocated` | Another process uses 8080. Stop it, or change the left side of `"8080:80"` in `compose.yaml`. |
 | `backend` restarts, logs show `connection refused` / `password authentication failed` | DB not ready, or credentials in `.env` differ from those used when the volume was first created. Check `docker compose logs db`. |
-| `502 Bad Gateway` on `/api/...` | Backend down or unhealthy: `docker compose ps`, `docker compose logs backend`. |
-| `nginx` exits with `host not found in upstream` | An upstream container is missing. Run `docker compose up -d` so all services exist, then `docker compose restart nginx`. |
-| Frontend shows "Unable to retrieve user information" | Open browser DevTools → Network. Requests must go to `/api/users/...` on port 8080. If they go to `localhost:8000`, the image was built with a wrong `VITE_API_URL`: `docker compose build --no-cache web-frontend`. |
-| Frontend build fails with `Could not read package.json` | `web-frontend/package.json` is required by the Dockerfile. |
-| Changes to code are not visible | Images must be rebuilt: `docker compose up --build -d`. |
-| Changes to the Nginx config are not applied | `docker compose restart nginx`; test syntax with `docker compose exec nginx nginx -t`. |
+| `502 Bad Gateway` on every page | Main proxy cannot reach `web-frontend`: `docker compose ps`, `docker compose logs web-frontend`. |
+| `502 Bad Gateway` only on `/api/...` | Web Frontend server cannot reach the backend: `docker compose logs web-frontend backend`, and check `docker compose exec web-frontend wget -q -O - http://backend:8000/health`. |
+| `nginx` exits with `host not found in upstream "web-frontend"` | The frontend container is missing. Run `docker compose up -d`, then `docker compose restart nginx`. |
+| Pages fail after recreating `web-frontend` | The main proxy cached the old IP: `docker compose restart nginx`. |
+| Frontend shows "Unable to retrieve user information" | Open browser DevTools → Network. Requests must go to `/api/users/...` on port 8080. If they go to `localhost:8000`, `.env` was included in the build context (check `web-frontend/.dockerignore`), then run `docker compose build --no-cache web-frontend`. |
+| Changes to code or `web-frontend/nginx.conf` are not visible | Images must be rebuilt: `docker compose up --build -d`. |
+| Changes to the main proxy config are not applied | `docker compose restart nginx`; test syntax with `docker compose exec nginx nginx -t`. |
 
 ## 8. Per-service compose files
 
@@ -198,3 +238,40 @@ running each part on its own during development. The root `compose.yaml` is the
 one used to run the integrated application. Do not run them at the same time as
 the root stack: the backend file also publishes port 8000 and uses fixed
 `container_name`s, and it uses a different volume (`cps_backend_postgres_data`).
+
+## 9. Scaling to a second stack instance (future work)
+
+The reverse proxy was designed to balance load between **two complete stack
+instances** (frontend + backend each). The current deployment runs **one**
+instance; the `backend_servers` upstream already uses `least_conn`, so adding a
+second instance does not change the load-balancing strategy.
+
+Outline of the future change (not implemented):
+
+1. Add `web-frontend-2` and `backend-2` services to `compose.yaml`, built from the
+   same Dockerfiles.
+2. Add a private network for the second pair (for example `app_net_2`, internal)
+   so `web-frontend-2` only reaches `backend-2`. Attach `web-frontend-2` to
+   `edge_net` and `backend-2` to `data_net` (both backends share the same database).
+3. Make the backend host used by the frontend server configurable, because
+   `web-frontend/nginx.conf` currently targets `backend`. The official Nginx image
+   supports this through `/etc/nginx/templates/*.template` and environment
+   variables (`envsubst`).
+4. Add the second server to the upstream in `etc/nginx/sites-available/localhost`:
+
+   ```nginx
+   upstream backend_servers{
+       least_conn;
+       server web-frontend:80;    # Stack instance 1
+       server web-frontend-2:80;  # Stack instance 2
+   }
+   ```
+
+5. Add `web-frontend-2` to the `depends_on` list of the `nginx` service.
+
+## 10. Pending validation by the team
+
+| Item | Owner | Reason |
+|------|-------|--------|
+| `web-frontend/package.json`, `web-frontend/package-lock.json`, `web-frontend/vite.config.js` | Web frontend | They were missing from the repository and are required by the existing Dockerfile (`COPY package*.json`, `npm run build`). Dependency versions must be confirmed, or replaced with the team's original files. |
+| `web-frontend/nginx.conf` and the `COPY nginx.conf` line in `web-frontend/Dockerfile` | Web frontend | Adds the SPA fallback and the `/api/` connector to the backend in the existing frontend Nginx. |
