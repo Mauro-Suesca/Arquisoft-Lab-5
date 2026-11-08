@@ -1,0 +1,92 @@
+# CPS Calculator - full stack
+#
+#   Browser --> nginx (host :8080) --> web-frontend (React static build)
+#                                  \-> backend (FastAPI :8000) --> db (PostgreSQL :5432)
+#
+# Start everything with:  docker compose up --build -d
+# Only the nginx service publishes a port on the host.
+
+name: cps-calculator
+
+services:
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cps_db}
+      POSTGRES_USER: ${POSTGRES_USER:-cps_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cps_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - data_net
+    restart: unless-stopped
+    # No "ports": the database is reachable only inside data_net.
+
+  backend:
+    build:
+      context: ./cps_backend
+      dockerfile: dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cps_user}:${POSTGRES_PASSWORD:-cps_password}@db:5432/${POSTGRES_DB:-cps_db}
+    # Same command as the Dockerfile, plus --root-path so the interactive
+    # docs (/api/docs) work behind the "/api" prefix. Routes are unchanged.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--root-path", "/api"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app_net
+      - data_net
+    restart: unless-stopped
+    # No "ports": the API is reachable only through nginx.
+
+  web-frontend:
+    build:
+      context: ./web-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    networks:
+      - app_net
+    restart: unless-stopped
+    # No "ports": the static site is reachable only through nginx.
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./etc/nginx/sites-available/localhost:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      web-frontend:
+        condition: service_started
+    networks:
+      - app_net
+    restart: unless-stopped
+
+networks:
+  # nginx <-> web-frontend <-> backend
+  app_net:
+    driver: bridge
+  # backend <-> db only. "internal" blocks any traffic to/from outside Docker.
+  data_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:

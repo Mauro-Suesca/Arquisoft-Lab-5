@@ -1,24 +1,41 @@
-upstream backend_servers{
-    least_conn;
-    server localhost:3000;  # Backend 1 (modificar cuando esté el docker)
-    server localhost:3001;  # Backend 2 (modificar cuando esté el docker)
+# Reverse proxy configuration for the CPS Calculator.
+# Mounted into the "nginx" container as /etc/nginx/conf.d/default.conf
+# (see compose.yaml in the repository root).
+#
+# Upstreams are resolved through Docker's internal DNS using the
+# Docker Compose service names, never "localhost".
+
+upstream frontend_servers {
+    server web-frontend:80;
 }
 
-server{
-    #Escuchar requests de HTTP en el puerto 80
+upstream backend_servers {
+    # least_conn is kept so more backend replicas can be added later.
+    least_conn;
+    server backend:8000;
+}
+
+server {
+    # Listen for HTTP requests on port 80 (published as 8080 on the host)
     listen 80;
 
     server_name localhost;
- 
-    #Requests a la URL (/)
+
+    # Common headers forwarded to every upstream
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Backend API: /api/<path> -> http://backend:8000/<path>
+    # The trailing slash in proxy_pass strips the "/api" prefix,
+    # so the FastAPI routes (/health, /users/{name}) stay unchanged.
+    location /api/ {
+        proxy_pass http://backend_servers/;
+    }
+
+    # Frontend: everything else is served by the React static build
     location / {
-        #Proxy a los servers de backend
-        proxy_pass http://backend_servers;
-        
-        #Reenviar headers importantes al server de backend
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://frontend_servers;
     }
 }

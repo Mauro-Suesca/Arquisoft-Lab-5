@@ -1,0 +1,6 @@
+# Local Docker Compose overrides (credentials)
+/.env
+
+# Python
+__pycache__/
+*.pyc
