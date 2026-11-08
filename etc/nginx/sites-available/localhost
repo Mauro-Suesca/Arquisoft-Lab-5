@@ -1,7 +1,6 @@
 upstream backend_servers{
     least_conn;
-    server localhost:3000;  # Backend 1 (modificar cuando esté el docker)
-    server localhost:3001;  # Backend 2 (modificar cuando esté el docker)
+    server web-frontend:80;  # Stack instance 1 (Docker Compose service)
 }
 
 server{
